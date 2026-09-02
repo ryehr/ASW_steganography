@@ -1,0 +1,19 @@
+# Core: language model inference, soft-bridge training and the LoRA case study.
+torch>=2.5
+transformers>=4.45
+accelerate>=1.0
+peft>=0.13
+datasets>=3.0
+pandas>=2.0
+tqdm
+
+# 3.Stega_evaluation.py: BLEU / ROUGE-L / BERTScore / perplexity.
+evaluate>=0.4
+rouge_score
+nltk
+bert_score
+absl-py
+
+# 6.Steganalysis.py: the BERT discriminator.
+scikit-learn
+numpy

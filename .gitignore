@@ -1,0 +1,21 @@
+# Trained bridges and adapters
+1.soft_prompt/
+1.lora_checkpoints/
+
+# Experiment outputs
+2.data/
+3.Stega_data/
+4.Extract_data/
+6.Steganalysis/
+*.log
+
+# Local secrets
+OPENAI_API_KEY.txt
+
+# Paper PDF and other local scratch
+*.pdf
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
