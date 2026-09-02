@@ -15,7 +15,8 @@ from peft import get_peft_model, LoraConfig, TaskType
 from copy import deepcopy
 import logging
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 设置可见的 GPU 设备
+# Devices come from CUDA_VISIBLE_DEVICES / accelerate, never from a hard-coded
+# index: pinning the teacher to 'cuda:1' fails on any single-GPU machine.
 
 def get_embeddings(model_temporary, temporary_input_ids):
     """统一获取embedding的方法"""
@@ -83,11 +84,20 @@ if main := '__main__':
     parser.add_argument('--batch_size', default = 10, type = int, required = False)
     parser.add_argument('--KL_reverse', default = 0, type = int, required = False)
     parser.add_argument('--step', default = 50, type = int, required = False)
-    parser.add_argument('--partial', default = 1.0, type = float, required = False) 
+    parser.add_argument('--partial', default = 1.0, type = float, required = False)
+    parser.add_argument('--teacher_device', default = None, type = str, required = False,
+                        help='device for the frozen teacher; defaults to the student device')
+    parser.add_argument('--output_dir', default = '1.lora_checkpoints', type = str, required = False)
+    parser.add_argument('--lr', default = 1e-4, type = float, required = False)
+    parser.add_argument('--seed', default = 0, type = int, required = False)
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     accelerator = Accelerator()
     device = accelerator.device
+    os.makedirs(args.output_dir, exist_ok=True)
 
     logging.basicConfig(filename='lora.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -125,7 +135,7 @@ if main := '__main__':
         soft_prompt_module = SoftPromptEmbedding(torch.randn(args.soft_prompt_length, embedding_size))
     
     trainable_params = list(model_student.parameters()) + list(soft_prompt_module.parameters())
-    optimizer = AdamW(trainable_params, lr=1e-4)
+    optimizer = AdamW(trainable_params, lr=args.lr)
     
     soft_length = soft_prompt_module.soft_prompt.shape[0]
 
@@ -164,7 +174,7 @@ if main := '__main__':
     model_student, soft_prompt_module, dataloader, optimizer = accelerator.prepare(model_student, soft_prompt_module, train_dataloader, optimizer)
     model_student.train()
     
-    model_teacher.to('cuda:1')
+    model_teacher.to(args.teacher_device or accelerator.device)
     model_teacher.eval()
 
     # print(model_student)
@@ -174,6 +184,7 @@ if main := '__main__':
     # context_window = 10  # 你定义的限制窗口
     
     initial_index = random.randint(0, args.step - 1)  # 随机起始位置
+    best_val_loss = float('inf')
     for epoch in range(args.epochs):
         total_loss = 0
         total_step = 0
@@ -332,7 +343,21 @@ if main := '__main__':
         if accelerator.is_main_process:
             print(f"Epoch {epoch+1} Validation KL Loss: {val_avg_loss:.4f}")
             # 保存 soft prompt
-            model_student.save_pretrained(f"1.lora_checkpoints/epoch_{epoch+1}_soft_length_{soft_length}_reverse_{args.KL_reverse}_{model_name.split('/')[-1]}_{val_avg_loss:.4f}")
+            stem = model_name.split('/')[-1]
+            tag = f'soft_length_{soft_length}_reverse_{args.KL_reverse}_{stem}'
+            model_student.save_pretrained(os.path.join(
+                args.output_dir, f'epoch_{epoch+1}_{tag}_{val_avg_loss:.4f}'))
             if args.soft_prompt_length > 0:
                 soft_to_use = soft_prompt_module.module if hasattr(soft_prompt_module, "module") else soft_prompt_module
-                torch.save(soft_to_use.state_dict(), f'1.lora_checkpoints/lora_soft_length{soft_length}_epoch{epoch+1}_reverse{args.KL_reverse}_{model_name.split('/')[-1]}_{val_avg_loss:.4f}.pt')
+                torch.save(soft_to_use.state_dict(), os.path.join(
+                    args.output_dir,
+                    f'lora_soft_length{soft_length}_epoch{epoch+1}'
+                    f'_reverse{args.KL_reverse}_{stem}_{val_avg_loss:.4f}.pt'))
+            # Stable names so 3.Embed_AC.py does not need to be told which epoch won.
+            if val_avg_loss < best_val_loss:
+                best_val_loss = val_avg_loss
+                model_student.save_pretrained(os.path.join(args.output_dir, f'best_{tag}'))
+                if args.soft_prompt_length > 0:
+                    torch.save(soft_to_use.state_dict(), os.path.join(
+                        args.output_dir, f'best_lora_soft_{tag}.pt'))
+                print(f'  new best ({best_val_loss:.4f})')

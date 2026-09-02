@@ -1,126 +1,184 @@
-import pandas as pd
+"""Text-quality and efficiency metrics for stegotexts (Table 2).
+
+Compares each stegotext file against the covertexts from 3.Generation_normal.py
+and reports the columns of Table 2:
+
+    dPPL        |PPL(stegotext) - PPL(covertext)|, the paper's absolute
+                difference rather than raw perplexity
+    BLEU        2-gram, per Section 7.2.1
+    ROUGE-L
+    BERTScore   F1
+    Capacity    embedded bits per token
+    Time        seconds to embed one stegotext
+
+Steganalysis accuracy, the fifth Table 2 column, comes from 6.Steganalysis.py.
+
+Example:
+    python 3.Stega_evaluation.py --model Qwen2.5-7B-Instruct --dataset instinwild_en
+"""
+
+import argparse
+import functools
+import glob
+import json
+import logging
 import os
+
 import evaluate
 import numpy as np
-from openai import OpenAI
-import logging
-import argparse
-from transformers import AutoTokenizer
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+import asw
 
-def cosine_similarity(vec1, vec2):
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
-def calculate_bleu_score(candidate_data, ref_data):
-    bleu = evaluate.load("bleu")
-    score = bleu.compute(predictions=candidate_data, references=ref_data, max_order = 2)['bleu']
-    logging.warning('BLEU: {}'.format(score))
-    return 
+@functools.lru_cache(maxsize=None)
+def metric(name):
+    """Load an evaluate metric once, then reuse it across candidate files."""
+    # module_type disambiguates 'perplexity', which also exists as a measurement.
+    return evaluate.load(name, module_type='metric')
 
-def calculate_rouge_score(candidate_data, ref_data):
 
-    rouge = evaluate.load("rouge")
-    result = rouge.compute(predictions=candidate_data, references=ref_data)
-    score = result['rougeL']
+@functools.lru_cache(maxsize=None)
+def ppl_model(model_id, device):
+    """The scorer for perplexity, loaded once."""
+    model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    return model, tokenizer
 
-    # print('ROUGE:',score)
-    logging.warning('ROUGE: {}'.format(score))
-    return
 
-def calculate_BERTScore(candidate_data, ref_data):
+@torch.no_grad()
+def perplexity(texts, args):
+    """Mean per-text perplexity under ``--ppl_model``.
 
-    bertscore = evaluate.load("bertscore")
-    result = bertscore.compute(predictions=candidate_data, references=ref_data, model_type="distilbert-base-uncased")
-    score = sum(result['f1'])/len(result['f1'])
+    Computed directly rather than through `evaluate`'s perplexity metric, which
+    requires a transformers version below v5.  The arithmetic is the same:
+    exponentiate each text's mean token NLL, then average over texts.
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model, tokenizer = ppl_model(args.ppl_model, device)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # print('BERTScore:',score)
-    logging.warning('BERTScore: {}'.format(score))
-    return
+    scores = []
+    for start in range(0, len(texts), args.ppl_batch_size):
+        batch = texts[start:start + args.ppl_batch_size]
+        encoded = tokenizer(batch, return_tensors='pt', padding=True, truncation=True,
+                            max_length=args.ppl_max_length - 1)
+        input_ids = encoded['input_ids'].to(device)
+        mask = encoded['attention_mask'].to(device)
 
-def calculate_perplexity(candidate_data):
-    perplexity = evaluate.load("perplexity", module_type="metric")
-    truncated_texts = []
-    for text in candidate_data:
-        tokens = tokenizer.encode(text, truncation=True, max_length=512)
-        truncated_text = tokenizer.decode(tokens, skip_special_tokens=True)
-        truncated_texts.append(truncated_text)
-    score = perplexity.compute(predictions=truncated_texts, model_id="gpt2", batch_size = 2)['mean_perplexity']
-    logging.warning('PPL: {}'.format(score))
-    return score
+        # A leading BOS gives the first real token something to condition on,
+        # so it contributes to the score like every other token.
+        bos = torch.full((input_ids.shape[0], 1), tokenizer.bos_token_id, device=device)
+        input_ids = torch.cat([bos, input_ids], dim=1)
+        mask = torch.cat([torch.ones_like(bos), mask], dim=1)
 
-def calculate_embedding_similarity(candidate_data, ref_data):
-    with open('OPENAI_API_KEY.txt', 'r', encoding='utf-8') as f:
-        os.environ['OPENAI_API_KEY'] = f.read()
-    client = OpenAI()
-    score = 0.0
-    for i in range(len(candidate_data)):
-        result_candi = client.embeddings.create(model = "text-embedding-ada-002",input = candidate_data[i],encoding_format="float").data[0].embedding
-        result_ref = client.embeddings.create(model = "text-embedding-ada-002",input = ref_data[i],encoding_format="float").data[0].embedding
-        score += cosine_similarity(result_candi, result_ref)
-        # print(score/(i+1))
-        
+        logits = model(input_ids=input_ids, attention_mask=mask).logits
+        nll = F.cross_entropy(
+            logits[:, :-1].transpose(1, 2), input_ids[:, 1:], reduction='none')
+        target_mask = mask[:, 1:].float()
+        per_text = (nll * target_mask).sum(1) / target_mask.sum(1).clamp(min=1)
+        scores.extend(per_text.exp().tolist())
 
-    score /= len(candidate_data)
-    # print('Embedding Similarity:', score)
-    logging.warning('Embedding Similarity: {}'.format(score))
-    return score
+    return float(np.mean(scores))
 
-def evaluate_all(candidate_data, ref_data):
-    calculate_bleu_score(candidate_data, ref_data)
-    calculate_rouge_score(candidate_data, ref_data)
-    calculate_BERTScore(candidate_data, ref_data)
-    # calculate_embedding_similarity(candidate_data, ref_data)
-    calculate_perplexity(candidate_data)
-    # calculate_perplexity(ref_data)
 
-def get_information(candidate_file):
-    Avg_bpt = round(pd.read_csv(candidate_file, sep='\t')['BPT'].mean(), 3)
-    logging.warning('Average BPT: {}'.format(Avg_bpt))
-    Avg_entropy = round(pd.read_csv(candidate_file, sep='\t')['Entropy'].mean(), 3)
-    logging.warning('Average Entropy: {}'.format(Avg_entropy))
-    Avg_Time = round(pd.read_csv(candidate_file, sep='\t')['Time'].mean(), 3)
-    logging.warning('Average Time: {}'.format(Avg_Time))
-    
-if __name__ == "__main__":
+def evaluate_group(candidates, references, reference_ppl, args):
+    scores = {}
+    scores['BLEU'] = metric('bleu').compute(
+        predictions=candidates, references=references, max_order=2)['bleu']
+    scores['ROUGE-L'] = metric('rouge').compute(
+        predictions=candidates, references=references)['rougeL']
+    bert = metric('bertscore').compute(
+        predictions=candidates, references=references,
+        model_type=args.bertscore_model)
+    scores['BERTScore'] = float(np.mean(bert['f1']))
+
+    candidate_ppl = perplexity(candidates, args)
+    scores['PPL'] = candidate_ppl
+    # Table 2 reports the absolute gap to the covertexts rather than raw
+    # perplexity, in either direction.
+    scores['dPPL'] = abs(candidate_ppl - reference_ppl)
+    return scores
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='Qwen2.5-7B-Instruct', required=False)
-    parser.add_argument('--window_size', type=int, default=10, required=False)
+    parser.add_argument('--model', default='Qwen2.5-7B-Instruct', type=str)
+    parser.add_argument('--dataset', default='instinwild_en', type=str)
+    parser.add_argument('--folder', default='3.Stega_data', type=str)
+    parser.add_argument('--reference_file', default=None, type=str,
+                        help='defaults to Normal_<model>_<dataset>.tsv in --folder')
+    parser.add_argument('--ppl_model', default='gpt2', type=str)
+    parser.add_argument('--ppl_batch_size', default=8, type=int)
+    parser.add_argument('--ppl_max_length', default=512, type=int)
+    parser.add_argument('--bertscore_model', default='distilbert-base-uncased', type=str)
+    parser.add_argument('--output', default='3.Stega_data/evaluation.json', type=str)
+    parser.add_argument('--log', default='experiment.log', type=str)
     args = parser.parse_args()
 
-    ref_file = '3.Stega_data/Normal_{}_supernatural.tsv'.format(args.model)
-    
-    logging.basicConfig(filename='experiment.log', level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    logging.basicConfig(filename=args.log, level=logging.WARNING,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
 
-    folder_path = '3.Stega_data'
-    files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+    reference_file = args.reference_file or os.path.join(
+        args.folder, f'Normal_{args.model}_{args.dataset}.tsv')
+    if not os.path.exists(reference_file):
+        raise SystemExit(f'{reference_file} not found; run 3.Generation_normal.py first')
 
-    for candidate_file in files:
-        # if 'Baseline' not in candidate_file:
-        #     continue
-        # if 'full' not in candidate_file:
-        #     continue
-        if 'supernatural' not in candidate_file:
-            continue
-        if 'Normal' in candidate_file:
-            continue
-        # if 'full' not in candidate_file:
-        #     continue
-        if args.model not in candidate_file:
-            continue
-        logging.warning('Evaluating the file: {}'.format(candidate_file))
-        candidate_file = folder_path + '/' + candidate_file
-        candidate_data = list(pd.read_csv(candidate_file, sep='\t')['Text'])
+    reference_all = list(asw.read_stega_tsv(reference_file)['Text'].astype(str))
 
-        ref_data = list(pd.read_csv(ref_file, sep='\t')['Text'])[:len(candidate_data)]  # Ensure the reference data matches the candidate data length
+    # The covertexts are the same for every candidate file, so their perplexity
+    # is computed once.
+    reference_ppl = perplexity(reference_all, args)
+    print(f'reference PPL ({os.path.basename(reference_file)}): {reference_ppl:.3f}')
+    logging.warning(f'Reference PPL: {reference_ppl}')
 
-        assert len(candidate_data) == len(ref_data), "The number of candidate data and reference data must be the same."
-        logging.warning('Sample size: {}'.format(len(candidate_data)))
+    candidates = sorted(
+        f for f in glob.glob(os.path.join(args.folder, '*.tsv'))
+        if args.model in os.path.basename(f)
+        and args.dataset in os.path.basename(f)
+        and 'Normal' not in os.path.basename(f))
+    if not candidates:
+        raise SystemExit(f'no stegotext files for {args.model} / {args.dataset} in {args.folder}')
 
-        get_information(candidate_file)
-        evaluate_all(candidate_data, ref_data)
-        pass
+    results = {}
+    for candidate_file in candidates:
+        name = os.path.basename(candidate_file)
+        print(f'\n=== {name} ===')
+        logging.warning(f'Evaluating the file: {name}')
+
+        df = asw.read_stega_tsv(candidate_file)
+        candidate_data = list(df['Text'].astype(str))
+        references = reference_all[:len(candidate_data)]
+        if len(references) != len(candidate_data):
+            print(f'  ! {len(candidate_data)} stegotexts but only {len(references)} '
+                  f'covertexts; comparing the first {len(references)}')
+            candidate_data = candidate_data[:len(references)]
+
+        scores = evaluate_group(candidate_data, references, reference_ppl, args)
+        # Efficiency columns come straight out of the embedding run.
+        scores['Capacity'] = float(df['BPT'].mean()) if 'BPT' in df else float('nan')
+        scores['Entropy'] = float(df['Entropy'].mean())
+        scores['Time'] = float(df['Time'].mean())
+        scores['Samples'] = len(candidate_data)
+
+        results[name] = scores
+        for key, value in scores.items():
+            print(f'  {key:11s} {value:.4f}' if isinstance(value, float) else
+                  f'  {key:11s} {value}')
+            logging.warning(f'{key}: {value}')
+
+    asw.ensure_dir(args.output)
+    with open(args.output, 'w', encoding='utf-8') as f:
+        json.dump({'reference_ppl': reference_ppl, 'results': results}, f, indent=2)
+
+    print(f'\n{"file":60s}{"dPPL":>9}{"BLEU":>8}{"ROUGE-L":>9}{"BERTScore":>11}'
+          f'{"Capacity":>10}{"Time":>8}')
+    for name, s in results.items():
+        print(f'{name[:59]:60s}{s["dPPL"]:9.3f}{s["BLEU"]:8.3f}{s["ROUGE-L"]:9.3f}'
+              f'{s["BERTScore"]:11.3f}{s["Capacity"]:10.3f}{s["Time"]:8.2f}')
+    print(f'\nwritten to {args.output}')
